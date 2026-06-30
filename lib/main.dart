@@ -10,12 +10,51 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'dart:async';
+import 'l10n/app_localizations.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 final FlutterLocalNotificationsPlugin notifications =
     FlutterLocalNotificationsPlugin();
 
+String? lastNotifiedStore;
+DateTime? lastNotificationTime;
+
+Future<void> initializeService() async {
+  final service = FlutterBackgroundService();
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: true,
+      foregroundServiceNotificationId: 999,
+      initialNotificationTitle: 'MerkDir',
+      initialNotificationContent: 'Background service running',
+    ),
+    iosConfiguration: IosConfiguration(),
+  );
+  await service.startService();
+}
+Future<void> requestLocationPermission() async {
+  bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+
+  if (!serviceEnabled) {
+    return;
+  }
+
+  LocationPermission permission =
+      await Geolocator.checkPermission();
+
+  if (permission == LocationPermission.denied) {
+    await Geolocator.requestPermission();
+  }
+}
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initializeService();
+
 
   const androidSettings =
       AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -30,11 +69,232 @@ void main() async {
     .resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>()
     ?.requestNotificationsPermission();
-
+  
+  await requestLocationPermission();
+  await initializeService();
   await loadProducts();
   await loadShoppingList();
+  await loadAvailableStores();
+  await loadNotificationSettings();
+  await loadSavedLanguage();
 
   runApp(const MerkDirApp());
+}
+
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) {
+
+  if (service is AndroidServiceInstance) {
+    service.setAsForegroundService();
+  }
+
+  print('BACKGROUND SERVICE STARTED');
+
+  Timer.periodic(
+    Duration(minutes: checkIntervalMinutes),
+    (timer) async {
+      print('BACKGROUND TIMER RUNNING');
+
+      try {
+        await loadNotificationSettings();
+
+        print(
+          'Distance: $notificationDistance m | Interval: $checkIntervalMinutes min',
+        );
+        final position = await Geolocator.getCurrentPosition();
+
+        print('LAT: ${position.latitude}');
+        print('LON: ${position.longitude}');
+
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.reload();
+
+        final data = prefs.getStringList('shoppingList');
+
+        print("BACKGROUND ITEMS: ${data?.length}");
+        print(data);
+
+        print('SHOPPING ITEMS: ${data?.length ?? 0}');
+        final lat = position.latitude;
+        final lon = position.longitude;
+
+        final query = """
+        [out:json];
+        (
+          node["shop"~"supermarket|convenience"](around:$notificationDistance,$lat,$lon);
+          way["shop"~"supermarket|convenience"](around:$notificationDistance,$lat,$lon);
+          relation["shop"~"supermarket|convenience"](around:$notificationDistance,$lat,$lon);
+        );
+        out center tags;
+        """;
+
+        final response = await http.post(
+          Uri.parse('https://overpass-api.de/api/interpreter'),
+          headers: {
+            'Content-Type': 'text/plain',
+            'Accept': 'application/json',
+            'User-Agent': 'MerkDir-App',
+          },
+          body: query,
+        ).timeout(
+          const Duration(seconds: 15),
+        );
+
+        print('STORE STATUS: ${response.statusCode}');
+
+        if (response.statusCode == 200) {
+          final json = jsonDecode(response.body);
+          final elements = json['elements'] as List;
+
+          print('STORES FOUND: ${elements.length}');
+
+          elements.sort((a, b) {
+            double getDistance(dynamic element) {
+              double? lat2;
+              double? lon2;
+
+              if (element['type'] == 'node') {
+                lat2 = (element['lat'] as num?)?.toDouble();
+                lon2 = (element['lon'] as num?)?.toDouble();
+              } else if (element['center'] != null) {
+                lat2 = (element['center']['lat'] as num?)?.toDouble();
+                lon2 = (element['center']['lon'] as num?)?.toDouble();
+              }
+
+              if (lat2 == null || lon2 == null) {
+                return 999999;
+              }
+
+              return Geolocator.distanceBetween(
+                lat,
+                lon,
+                lat2,
+                lon2,
+              );
+            }
+
+            return getDistance(a).compareTo(getDistance(b));
+          });
+
+          for (final element in elements) {
+            final tags = element['tags'] ?? {};
+
+            final storeName =
+              (tags['name'] ?? '').toString();
+
+            if (storeName.isEmpty) continue;
+
+            double? storeLat;
+            double? storeLon;
+
+            if (element['type'] == 'node') {
+              storeLat = (element['lat'] as num?)?.toDouble();
+              storeLon = (element['lon'] as num?)?.toDouble();
+            } else if (element['center'] != null) {
+              storeLat = (element['center']['lat'] as num?)?.toDouble();
+              storeLon = (element['center']['lon'] as num?)?.toDouble();
+            }
+
+            if (storeLat == null || storeLon == null) {
+              continue;
+            }
+
+            final distance = Geolocator.distanceBetween(
+              lat,
+              lon,
+              storeLat,
+              storeLon,
+            );
+
+            print('DISTANCE TO $storeName: ${distance.toStringAsFixed(0)} m');
+
+            final storeId = element['id'].toString();
+
+            if (distance > notificationDistance) {
+              continue;
+            }
+            final matchingItems = <String>[];
+
+            for (final itemJson in data ?? []) {
+              final decoded = jsonDecode(itemJson);
+
+              print(
+                "${decoded['name']}  bought=${decoded['bought']}"
+              );
+
+              final bought = decoded['bought'] ?? false;
+
+              if (bought) continue;
+
+              final stores =
+              List<String>.from(decoded['stores'] ?? []);
+
+              String normalizedStore = storeName.toLowerCase();
+
+              if (normalizedStore.contains('voi')) {
+                normalizedStore = 'migros';
+              }
+              if (normalizedStore.contains('migrolino')) {
+                normalizedStore = 'migros';
+              }
+              if (normalizedStore.contains('coop pronto')) {
+                normalizedStore = 'coop';
+              }
+              if (normalizedStore.contains('aldi suisse')) {
+                normalizedStore = 'aldi';
+              }
+              print('STORE MATCH CHECK: $storeName -> $normalizedStore');
+
+              final matches = stores.any(
+                (s) => normalizedStore.contains(
+                  s.toLowerCase(),
+                ),
+              );
+
+              if (matches) {
+                matchingItems.add(decoded['name']);
+              }
+            }
+
+            if (matchingItems.isNotEmpty) {
+
+              final now = DateTime.now();
+
+              if (lastNotifiedStore == storeId &&
+                  lastNotificationTime != null &&
+                  now.difference(lastNotificationTime!).inMinutes < checkIntervalMinutes) {
+                continue;
+              }
+
+              lastNotifiedStore = storeId;
+              lastNotificationTime = now;
+
+            print('MATCH FOUND IN $storeName');
+            print(matchingItems);
+
+            await showStoreNotification(
+              storeName,
+              matchingItems
+                .map(
+                  (e) => ShoppingItem(
+                    name: e,
+                    stores: [],
+                    priority: 'normal',
+                  ),
+                )
+                .toList(),
+              );
+
+              break;
+            }
+          }
+        }
+
+      } catch (e) {
+        print('GPS ERROR: $e');
+      }
+    },
+  );
 }
 
 Future<void> showStoreNotification(
@@ -43,7 +303,7 @@ Future<void> showStoreNotification(
 ) async {
   await notifications.show(
     id: 1,
-    title: '🔔 $store in der Nähe',
+    title: '🔔 $store nearby',
     body: items
       .map((e) => e.name)
       .take(3)
@@ -123,6 +383,17 @@ Future<void> loadProducts() async {
     }
   }
 }
+Locale currentLocale = const Locale('lt');
+
+Future<void> loadSavedLanguage() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  final lang = prefs.getString('language');
+
+  if (lang != null) {
+    currentLocale = Locale(lang);
+  }
+}
 
 class MerkDirApp extends StatelessWidget {
   const MerkDirApp({super.key});
@@ -130,6 +401,13 @@ class MerkDirApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      locale: currentLocale,
+
+      localizationsDelegates:
+        AppLocalizations.localizationsDelegates,
+
+      supportedLocales:
+        AppLocalizations.supportedLocales,
       debugShowCheckedModeBanner: false,
       builder: (context, child) {
         ErrorWidget.builder = (FlutterErrorDetails details) {
@@ -144,14 +422,78 @@ class MerkDirApp extends StatelessWidget {
         return child!;
       },
       title: 'MerkDir',
-      theme: ThemeData(colorSchemeSeed: Colors.deepPurple),
+
+      theme: ThemeData(
+        brightness: Brightness.dark,
+
+        scaffoldBackgroundColor: const Color(0xFF1E1E1E),
+
+        colorScheme: ColorScheme.dark(
+          primary: const Color(0xFFFF8C00),
+          secondary: const Color(0xFFFF8C00),
+          surface: const Color(0xFF2A2A2A),
+        ),
+
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF2A2A2A),
+          foregroundColor: Colors.white,
+          elevation: 0,
+        ),
+
+        cardColor: const Color(0xFF2A2A2A),
+
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFFFF8C00),
+            foregroundColor: Colors.white,
+            minimumSize: const Size(double.infinity, 50),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: const Color(0xFF2A2A2A),
+
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide.none,
+          ),
+
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide.none,
+          ),
+
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: const BorderSide(
+              color: Color(0xFFFF8C00),
+              width: 2,
+            ),
+          ),
+        ),
+      ),
       home: const HomePage(),
     );
   }
 }
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+
+  final quickProductController =
+    TextEditingController();
+
+  Uint8List? quickPhoto;
 
   void openAddProduct(BuildContext context) {
     Navigator.push(
@@ -166,41 +508,299 @@ class HomePage extends StatelessWidget {
       MaterialPageRoute(builder: (_) => const FavoritesPage()),
     );
   }
+  Future<void> pickQuickPhoto() async {
+    final picker = ImagePicker();
+
+    final file = await picker.pickImage(
+      source: ImageSource.camera,
+    );
+
+    if (file == null) return;
+
+    quickPhoto = await file.readAsBytes();
+
+    setState(() {});
+
+    await addQuickShoppingItem();
+  }
+
+  Future<List<String>?> selectStoresDialog(
+  BuildContext context,
+  ) async {
+    final selectedStores = <String>[];
+
+    return await showDialog<List<String>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            title: Text(
+              AppLocalizations.of(context)!.selectStores,
+            ),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: ListView(
+                shrinkWrap: true,
+                children: availableStores.map((store) {
+                  return CheckboxListTile(
+                    title: Text(store),
+                    value: selectedStores.contains(store),
+                    onChanged: (value) {
+                      setDialogState(() {
+                        if (value == true) {
+                          selectedStores.add(store);
+                        } else {
+                          selectedStores.remove(store);
+                        }
+                      });
+                    },
+                  );
+                }).toList(),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(
+                    context,
+                    List<String>.from(availableStores),
+                  );
+                },
+                child: Text(
+                  AppLocalizations.of(context)!.allStores,
+                ),
+              ),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(
+                    context,
+                    selectedStores.isEmpty
+                        ? List<String>.from(availableStores)
+                        : selectedStores,
+                  );
+                },
+                child: Text(
+                  AppLocalizations.of(context)!.add,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> addQuickShoppingItem() async {
+    if (quickProductController.text.trim().isEmpty &&
+        quickPhoto == null) {
+      return;
+    }
+    final stores = await selectStoresDialog(context);
+
+    if (stores == null) return;
+
+    shoppingList.add(
+      ShoppingItem(
+        name: quickProductController.text.trim().isEmpty
+            ? '📷 Produktas'
+            : quickProductController.text.trim(),
+        stores: stores,
+        priority: 'Normal',
+      ),
+    );
+
+    saveShoppingList();
+
+    quickProductController.clear();
+
+    setState(() {
+      quickPhoto = null;
+    });
+  }
+  
+  void addQuickFavorite() {
+    if (quickProductController.text.trim().isEmpty &&
+        quickPhoto == null) {
+      return;
+    }
+
+    favoriteProducts.add(
+      Product(
+        title: quickProductController.text.trim().isEmpty
+            ? '📷 Produktas'
+            : quickProductController.text.trim(),
+        category: '',
+        rating: 5,
+        notes: '',
+        image: quickPhoto,
+      ),
+    );
+
+    saveProducts();
+
+    quickProductController.clear();
+
+    setState(() {
+      quickPhoto = null;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('MerkDir')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            ElevatedButton(
-              onPressed: () => openAddProduct(context),
-              child: const Text('Produkt hinzufügen'),
-            ),
-            const SizedBox(height: 20),
+      appBar: AppBar(
+        title: const Text('MerkDir'),
+        actions: [
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.language),
+            onSelected: (value) async {
+              final prefs = await SharedPreferences.getInstance();
 
-            ElevatedButton(
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const ShoppingListPage(),
+              await prefs.setString(
+                'language',
+                value,
+              );
+
+              currentLocale = Locale(value);
+
+              runApp(const MerkDirApp());
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'de',
+                child: Text('🇩🇪 Deutsch'),
+              ),
+              const PopupMenuItem(
+                value: 'en',
+                child: Text('🇬🇧 English'),
+              ),
+              const PopupMenuItem(
+                value: 'lt',
+                child: Text('🇱🇹 Lietuvių'),
+              ),
+            ],
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+           
+
+            Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      AppLocalizations.of(context)!.quickAdd,
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+
+                    const SizedBox(height: 20),
+
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: quickProductController,
+                            decoration: InputDecoration(
+                              prefixIcon: Icon(
+                                Icons.shopping_basket,
+                                color: Color(0xFFFF8C00),
+                              ),
+                              hintText:
+                                AppLocalizations.of(context)!.productNameHint,
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(width: 12),
+
+                        IconButton(
+                          iconSize: 40,
+                          onPressed: pickQuickPhoto,
+                          icon: const Icon(Icons.camera_alt),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 20),
+
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: addQuickShoppingItem,
+                            icon: Icon(Icons.shopping_cart),
+                            label: Text(
+                              AppLocalizations.of(context)!.toShoppingList,
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(width: 12),
+
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: addQuickFavorite,
+                            icon: Icon(Icons.star),
+                            label: Text(
+                              AppLocalizations.of(context)!.toFavorites,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const ShoppingListPage(),
+                          ),
+                        );
+                      },
+                  child: Text(
+                    AppLocalizations.of(context)!.shoppingList,
                   ),
-                );
-              },
-              child: const Text('Einkaufsliste'),
+                ),
+              ),
             ),
             const SizedBox(height: 20),
-            ElevatedButton(
+            
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
               onPressed: () => openFavorites(context),
-              child: const Text('Favoriten'),
+              child: Text(
+                AppLocalizations.of(context)!.favorites,
+              ),
+            ),
+            ),
             ),
 
             const SizedBox(height: 20),
 
-            ElevatedButton(
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
               onPressed: () {
                 Navigator.push(
                   context,
@@ -209,11 +809,19 @@ class HomePage extends StatelessWidget {
                   ),
                 );
               },
-              child: const Text('📍 Geschäfte in der Nähe'),
+              child: Text(
+                AppLocalizations.of(context)!.nearbyStores,
+              ),
+            ),
+            ),
             ),
             const SizedBox(height: 20),
 
-            ElevatedButton(
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
               onPressed: () {
                 Navigator.push(
                   context,
@@ -222,9 +830,36 @@ class HomePage extends StatelessWidget {
                   ),
                 );
               },
-              child: const Text('GPS Test'),
+              child: Text(
+                AppLocalizations.of(context)!.searchStores,
+              ),
+            ),
+            ),
+            ),
+
+            const SizedBox(height: 20),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const SettingsPage(),
+                  ),
+                );
+              },
+              child: Text(
+            AppLocalizations.of(context)!.settings,
+          ),
+            ),
+            ),
             ),
           ],
+        ),
         ),
       ),
     );
@@ -272,7 +907,7 @@ class _AddProductPageState extends State<AddProductPage> {
 
     if (title.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Bitte Produktname eingeben')),
+        SnackBar(content: Text(AppLocalizations.of(context)!.enterProductName)),
       );
       return;
     }
@@ -290,7 +925,11 @@ class _AddProductPageState extends State<AddProductPage> {
     saveProducts();
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Gespeichert: $title')),
+      SnackBar(
+        content: Text(
+          '${AppLocalizations.of(context)!.saved} $title',
+        ),
+      ),
     );
 
     Navigator.pop(context);
@@ -301,31 +940,50 @@ class _AddProductPageState extends State<AddProductPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Produkt hinzufügen')),
+      appBar: AppBar(
+        title: Text(
+          AppLocalizations.of(context)!.addProduct,
+        ),
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
             TextField(
               controller: titleController,
-              decoration: const InputDecoration(
-                labelText: 'Produktname',
+              decoration: InputDecoration(
+                labelText: AppLocalizations.of(context)!.productName,
                 border: OutlineInputBorder(),
               ),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               value: category,
-              decoration: const InputDecoration(
-                labelText: 'Kategorie',
+              decoration: InputDecoration(
+                labelText: AppLocalizations.of(context)!.category,
                 border: OutlineInputBorder(),
               ),
-              items: const [
-                DropdownMenuItem(value: 'Wein', child: Text('Wein')),
-                DropdownMenuItem(value: 'Schokolade', child: Text('Schokolade')),
-                DropdownMenuItem(value: 'Snacks', child: Text('Snacks')),
-                DropdownMenuItem(value: 'Käse', child: Text('Käse')),
-                DropdownMenuItem(value: 'Getränke', child: Text('Getränke')),
+              items: [
+                DropdownMenuItem(
+                  value: 'Wein',
+                  child: Text(AppLocalizations.of(context)!.wine),
+                ),
+                DropdownMenuItem(
+                  value: 'Schokolade',
+                  child: Text(AppLocalizations.of(context)!.chocolate),
+                ),
+                DropdownMenuItem(
+                  value: 'Snacks',
+                  child: Text(AppLocalizations.of(context)!.snacks),
+                ),
+                DropdownMenuItem(
+                  value: 'Käse',
+                  child: Text(AppLocalizations.of(context)!.cheese),
+                ),
+                DropdownMenuItem(
+                  value: 'Getränke',
+                  child: Text(AppLocalizations.of(context)!.drinks),
+                ),
               ],
               onChanged: (value) {
                 if (value != null) setState(() => category = value);
@@ -334,8 +992,8 @@ class _AddProductPageState extends State<AddProductPage> {
             const SizedBox(height: 12),
             DropdownButtonFormField<int>(
               value: rating,
-              decoration: const InputDecoration(
-                labelText: 'Bewertung',
+              decoration: InputDecoration(
+                labelText: AppLocalizations.of(context)!.rating,
                 border: OutlineInputBorder(),
               ),
               items: const [
@@ -352,9 +1010,9 @@ class _AddProductPageState extends State<AddProductPage> {
             const SizedBox(height: 12),
             TextField(
               controller: notesController,
-              decoration: const InputDecoration(
-                labelText: 'Notizen',
-                border: OutlineInputBorder(),
+              decoration: InputDecoration(
+                labelText: AppLocalizations.of(context)!.notes,
+                border: const OutlineInputBorder(),
               ),
               maxLines: 3,
             ),
@@ -368,12 +1026,16 @@ class _AddProductPageState extends State<AddProductPage> {
             ElevatedButton.icon(
               onPressed: pickImage,
               icon: const Icon(Icons.photo),
-              label: const Text('Foto auswählen'),
+              label: Text(
+                AppLocalizations.of(context)!.selectPhoto,
+              ),
             ),
             const SizedBox(height: 20),
             ElevatedButton(
               onPressed: saveProduct,
-              child: const Text('Speichern'),
+              child: Text(
+                AppLocalizations.of(context)!.save,
+              ),
             ),
           ],
         ),
@@ -390,7 +1052,7 @@ class NearbyStoresPage extends StatefulWidget {
 }
 
 class _NearbyStoresPageState extends State<NearbyStoresPage> {
-  String status = 'Klicken Sie auf die Schaltfläche, um Geschäfte zu finden';
+  String status = '';
   Map<String, List<ShoppingItem>> storeMatches = {};
   bool notificationShown = false;
 
@@ -408,11 +1070,20 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
     });
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+
+    if (status.isEmpty) {
+      status = AppLocalizations.of(context)!.findStoresHint;
+    }
+  }
+
   Future<void> findStoresAndItems() async {
     print('FIND STORES STARTED');
     
     setState(() {
-      status = 'Suche nach Geschäften...';
+      status = AppLocalizations.of(context)!.searchingStores;
       storeMatches = {};
     });
     
@@ -428,9 +1099,9 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
     final query = """
     [out:json];
     (
-      node["shop"~"supermarket|convenience"](around:200,$lat,$lon);
-      way["shop"~"supermarket|convenience"](around:200,$lat,$lon);
-      relation["shop"~"supermarket|convenience"](around:200,$lat,$lon);
+      node["shop"~"supermarket|convenience"](around:500,$lat,$lon);
+      way["shop"~"supermarket|convenience"](around:500,$lat,$lon);
+      relation["shop"~"supermarket|convenience"](around:500,$lat,$lon);
     );
     out center tags;
     """;
@@ -454,7 +1125,7 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
 
     if (response.statusCode != 200) {
       setState(() {
-        status = 'Geschäfte konnten nicht gefunden werden';
+        status = AppLocalizations.of(context)!.storesNotFound;
       });
       return;
     }
@@ -473,10 +1144,16 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
     final stores = elements
         .map<String>((element) {
           final tags = element['tags'] ?? {};
-          return (tags['name'] ?? 'Unbekannter Laden').toString();
+          return (tags['name'] ?? '').toString();
         })
+        .where((s) => s.isNotEmpty)
         .toSet()
         .toList();
+      
+      print('STORES FOUND:');
+        for (final s in stores) {
+          print(s);
+        }  
 
     final Map<String, List<ShoppingItem>> matches = {};
 
@@ -502,8 +1179,8 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
     setState(() {
       storeMatches = matches;
       status = matches.isEmpty
-          ? 'Keine passenden Artikel für Geschäfte in der Nähe'
-          : 'Passende Geschäfte gefunden';
+          ? AppLocalizations.of(context)!.noNearbyMatches
+          : AppLocalizations.of(context)!.matchingStores;
     });
     if (matches.isEmpty) {
       notificationShown = false;
@@ -526,12 +1203,12 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
-          title: Text('🔔 $firstStore in der Nähe'),
+          title: Text('🔔 ${firstStore} ${AppLocalizations.of(context)!.nearby}'),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Offene Einkäufe:'),
+              Text(AppLocalizations.of(context)!.openShopping),
               const SizedBox(height: 10),
 
               ...items.map(
@@ -546,7 +1223,7 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
               onPressed: () {
                 Navigator.pop(context);
               },
-              child: const Text('Später'),
+              child: Text(AppLocalizations.of(context)!.later),
             ),
 
             TextButton(
@@ -560,7 +1237,7 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
                   ),
                 );
               },
-              child: const Text('Zur Einkaufsliste'),
+              child: Text(AppLocalizations.of(context)!.toShoppingList),
             ),
           ],
         ),
@@ -577,20 +1254,28 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('📍 Geschäfte in der Nähe'),
+        title: Text(
+          AppLocalizations.of(context)!.nearbyStores,
+        ),
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Text(status),
+            Text(
+              status.isEmpty
+                ? AppLocalizations.of(context)!.findStoresHint
+                : status,
+            ),
             const SizedBox(height: 16),
             ElevatedButton(
               onPressed: () {
                 debugPrint('BUTTON CLICKED');
                 findStoresAndItems();
               },
-              child: const Text('Geschäfte suchen'),
+              child: Text(
+                AppLocalizations.of(context)!.searchStores,
+              ),
             ),
             const SizedBox(height: 16),
             Expanded(
@@ -651,12 +1336,33 @@ class _FavoritesPageState extends State<FavoritesPage> {
     await saveProducts();
   }
 
+  String translateCategory(BuildContext context, String category) {
+    switch (category) {
+      case 'Wein':
+        return AppLocalizations.of(context)!.wine;
+      case 'Schokolade':
+        return AppLocalizations.of(context)!.chocolate;
+      case 'Snacks':
+        return AppLocalizations.of(context)!.snacks;
+      case 'Käse':
+        return AppLocalizations.of(context)!.cheese;
+      case 'Getränke':
+        return AppLocalizations.of(context)!.drinks;
+      default:
+        return category;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Favoriten')),
+      appBar: AppBar(
+        title: Text(
+          AppLocalizations.of(context)!.favorites,
+        ),
+      ),
       body: favoriteProducts.isEmpty
-          ? const Center(child: Text('Noch keine Produkte gespeichert'))
+          ? Center(child: Text(AppLocalizations.of(context)!.noSavedProducts,))
           : ListView.builder(
               padding: const EdgeInsets.all(16),
               itemCount: favoriteProducts.length,
@@ -694,7 +1400,7 @@ class _FavoritesPageState extends State<FavoritesPage> {
                         ),
                         const SizedBox(height: 6),
                         Text(
-                          product.category,
+                          translateCategory(context, product.category),
                           style: TextStyle(color: Colors.grey.shade700),
                         ),
                         const SizedBox(height: 6),
@@ -719,8 +1425,8 @@ class _FavoritesPageState extends State<FavoritesPage> {
                                 shoppingList.add(
                                   ShoppingItem(
                                     name: product.title,
-                                    stores: ['Beliebiges Geschäft'],
-                                    priority: 'Normal',
+                                    stores: [AppLocalizations.of(context)!.anyStore],
+                                    priority: AppLocalizations.of(context)!.normal,
                                   ),
                                 );
 
@@ -752,6 +1458,16 @@ class _FavoritesPageState extends State<FavoritesPage> {
         }
       }
 
+List<String> availableStores = [
+  'Lidl',
+  'Aldi',
+  'Rewe',
+  'Edeka',
+  'Coop',
+  'Migros',
+  'Denner',
+];
+
 class ShoppingItem {
   String name;
   List<String> stores;
@@ -767,6 +1483,42 @@ class ShoppingItem {
 }
 
 final List<ShoppingItem> shoppingList = [];
+
+double notificationDistance = 30;
+int checkIntervalMinutes = 1;
+
+Future<void> saveNotificationSettings() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  await prefs.setDouble(
+    'notificationDistance',
+    notificationDistance,
+  );
+
+  await prefs.setInt(
+    'checkIntervalMinutes',
+    checkIntervalMinutes,
+  );
+}
+
+Future<void> loadNotificationSettings() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  notificationDistance =
+      prefs.getDouble('notificationDistance') ?? 100;
+
+  checkIntervalMinutes =
+      prefs.getInt('checkIntervalMinutes') ?? 5;
+}
+
+Future<void> saveAvailableStores() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  await prefs.setStringList(
+    'availableStores',
+    availableStores,
+  );
+}
 
 Future<void> saveShoppingList() async {
   final prefs = await SharedPreferences.getInstance();
@@ -785,6 +1537,7 @@ Future<void> saveShoppingList() async {
 
 Future<void> loadShoppingList() async {
   final prefs = await SharedPreferences.getInstance();
+  await prefs.reload(); 
   final data = prefs.getStringList('shoppingList');
 
   if (data == null) return;
@@ -803,6 +1556,29 @@ Future<void> loadShoppingList() async {
       )
     );
   }
+}
+
+Future<void> loadAvailableStores() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  final data = prefs.getStringList('availableStores');
+
+  if (data == null) {
+    availableStores = [
+      'Lidl',
+      'Aldi',
+      'Rewe',
+      'Edeka',
+      'Coop',
+      'Migros',
+      'Denner',
+    ];
+
+    await saveAvailableStores();
+    return;
+  }
+
+  availableStores = List<String>.from(data);
 }
 
 class ShoppingListPage extends StatefulWidget {
@@ -837,11 +1613,31 @@ class _ShoppingListPageState extends State<ShoppingListPage> {
     selectedStores.clear();
   }
 
+  void addStore() {
+    print('ADD STORE PRESSED');
+    print(controller.text);
+
+    if (controller.text.trim().isEmpty) return;
+
+    setState(() {
+      if (!availableStores.contains(controller.text.trim())) {
+        availableStores.add(controller.text.trim());
+        print('STORE ADDED');
+      }
+    });
+
+    saveAvailableStores();
+
+    controller.clear();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Einkaufsliste'),
+        title: Text(
+          AppLocalizations.of(context)!.shoppingList,
+        ),
       ),
       body: Column(
         children: [
@@ -849,9 +1645,9 @@ class _ShoppingListPageState extends State<ShoppingListPage> {
             padding: const EdgeInsets.all(16),
             child: TextField(
               controller: controller,
-              decoration: const InputDecoration(
-                labelText: 'Produkt',
-                border: OutlineInputBorder(),
+              decoration: InputDecoration(
+                labelText: AppLocalizations.of(context)!.product,
+                border: const OutlineInputBorder(),
               ),
             ),
           ),
@@ -879,39 +1675,96 @@ class _ShoppingListPageState extends State<ShoppingListPage> {
             },
           ),
 
-          Wrap(
+          Row(
             children: [
-              'Lidl',
-              'Aldi',
-              'Rewe',
-              'Edeka',
-              'Coop',
-              'Migros',
-              'Denner',
-            ].map((store) {
-              return SizedBox(
-                width: 180,
-                child: CheckboxListTile(
-                  title: Text(store),
-                  value: selectedStores.contains(store),
-                  onChanged: (checked) {
-                    setState(() {
-                      if (checked == true) {
-                        selectedStores.add(store);
-                      } else {
-                        selectedStores.remove(store);
-                      }
-                    });
-                  },
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: addItem,
+                  child: Text(
+                    AppLocalizations.of(context)!.addProduct,
+                  ),
                 ),
-              );
-            }).toList(),
+              ),
+
+              const SizedBox(width: 12),
+
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: addStore,
+                  child: Text(
+                    AppLocalizations.of(context)!.addStore,
+                  ),
+                ),
+              ),
+            ],
           ),
 
-          ElevatedButton(
-            onPressed: addItem,
-            child: const Text('+'),
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              AppLocalizations.of(context)!.stores,
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ),
+
+          SizedBox(
+            height: 180,
+            child: GridView.builder(
+              shrinkWrap: true,
+              itemCount: availableStores.length,
+              gridDelegate:
+                  const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                childAspectRatio: 3.5,
+              ),
+              itemBuilder: (context, index) {
+                final store = availableStores[index];
+
+                return Row(
+                  children: [
+                    Expanded(
+                      child: CheckboxListTile(
+                        dense: true,
+                        title: Text(
+                          store,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        value: selectedStores.contains(store),
+                        onChanged: (checked) {
+                          setState(() {
+                            if (checked == true) {
+                              selectedStores.add(store);
+                            } else {
+                              selectedStores.remove(store);
+                            }
+                          });
+                        },
+                      ),
+                    ),
+
+                    IconButton(
+                      icon: const Icon(
+                        Icons.delete,
+                        color: Colors.red,
+                      ),
+                      onPressed: () {
+                        setState(() {
+                          availableStores.remove(store);
+                          selectedStores.remove(store);
+                        });
+
+                        saveAvailableStores();
+                      },
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+
+
 
           Expanded(
             child: ListView.builder(
@@ -939,28 +1792,216 @@ class _ShoppingListPageState extends State<ShoppingListPage> {
                       Icons.delete,
                       color: Colors.red,
                     ),
-                    onPressed: () {
+                    onPressed: () async {
                       setState(() {
                         shoppingList.removeAt(index);
                       });
-                      saveShoppingList();
+
+                      await saveShoppingList();
                     },
                   ),
 
                   value: item.bought,
 
-                  onChanged: (value) {
+                  onChanged: (value) async {
                     setState(() {
                       item.bought = value ?? false;
                     });
 
-                    saveShoppingList();
+                    await saveShoppingList();
                   },
                 );
               },
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          AppLocalizations.of(context)!.settings,
+        ),
+      ),
+      body: SingleChildScrollView(
+        child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Text(
+              AppLocalizations.of(context)!.notificationSettings,
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+
+            const SizedBox(height: 20),
+
+            Text(
+              AppLocalizations.of(context)!.notificationDistance,
+            ),
+
+            DropdownButton<double>(
+              value: notificationDistance,
+              isExpanded: true,
+              items: const [
+
+                DropdownMenuItem(
+                  value: 30,
+                  child: Text('30 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 50,
+                  child: Text('50 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 100,
+                  child: Text('100 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 200,
+                  child: Text('200 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 300,
+                  child: Text('300 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 500,
+                  child: Text('500 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 750,
+                  child: Text('750 m'),
+                ),
+
+                DropdownMenuItem(
+                  value: 1000,
+                  child: Text('1000 m'),
+                ),
+              ],
+              onChanged: (value) async {
+                if (value == null) return;
+
+                setState(() {
+                  notificationDistance = value;
+                });
+
+                await saveNotificationSettings();
+              },
+            ),
+
+            const SizedBox(height: 20),
+
+            Text(
+              AppLocalizations.of(context)!.checkInterval,
+            ),
+
+            DropdownButton<int>(
+              value: checkIntervalMinutes,
+              isExpanded: true,
+              items: const [
+
+                DropdownMenuItem(
+                  value: 1,
+                  child: Text('1 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 2,
+                  child: Text('2 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 5,
+                  child: Text('5 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 10,
+                  child: Text('10 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 15,
+                  child: Text('15 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 30,
+                  child: Text('30 min'),
+                ),
+
+                DropdownMenuItem(
+                  value: 60,
+                  child: Text('60 min'),
+                ),
+              ],
+              onChanged: (value) async {
+                if (value == null) return;
+
+                setState(() {
+                  checkIntervalMinutes = value;
+                });
+
+                await saveNotificationSettings();
+              },
+            ),
+
+            const Divider(height: 40),
+
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: Text(
+                AppLocalizations.of(context)!.aboutApp,
+              ),
+              onTap: () {
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('ℹ️ MerkDir™'),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '${AppLocalizations.of(context)!.version} 1.0',
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          '${AppLocalizations.of(context)!.createdBy}: Povilas Grušauskas',
+                        ),
+                        const SizedBox(height: 10),
+                        const Text('© 2025 Povilas Grušauskas'),
+                        Text(
+                          AppLocalizations.of(context)!.allRightsReserved,
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+                
+              },
+            )
+          ],
+        ),
+      ),
       ),
     );
   }
@@ -974,7 +2015,7 @@ class GpsTestPage extends StatefulWidget {
 }
 
 class _GpsTestPageState extends State<GpsTestPage> {
-  String locationText = 'Noch keine Position';
+  String locationText = '';
   List<String> nearbyStores = [];
 
   Future<void> getLocation() async {
@@ -1083,7 +2124,9 @@ class _GpsTestPageState extends State<GpsTestPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('GPS Test'),
+        title: Text(
+          AppLocalizations.of(context)!.findStores,
+        ),
       ),
       body: Center(
         child: Column(
@@ -1096,13 +2139,43 @@ class _GpsTestPageState extends State<GpsTestPage> {
             const SizedBox(height: 20),
 
             ...nearbyStores.map(
-              (store) => Text('🏪 $store'),
+              (store) => ListTile(
+                leading: const Icon(Icons.store),
+                title: Text(store),
+                trailing: const Icon(Icons.add_circle_outline),
+                onTap: () async {
+                  if (!availableStores.contains(store)) {
+                    setState(() {
+                      availableStores.add(store);
+                    });
+
+                    final prefs = await SharedPreferences.getInstance();
+
+                    await prefs.setStringList(
+                      'availableStores',
+                      availableStores,
+                    );
+
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            '$store ${AppLocalizations.of(context)!.storeAdded}',
+                          ),
+                        ),
+                      );
+                    }
+                  }
+                },
+              ),
             ),
 
             const SizedBox(height: 20),
             ElevatedButton(
               onPressed: getLocation,
-              child: const Text('Position prüfen'),
+              child: Text(
+                AppLocalizations.of(context)!.checkPosition,
+              ),
             ),
           ],
         ),
