@@ -8,6 +8,7 @@ class StoreState {
   DateTime? lockedUntil;
   DateTime? ignoreUntil;
 
+
   StoreState({
     required this.storeId,
     this.insideZone = false,

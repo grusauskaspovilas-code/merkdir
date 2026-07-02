@@ -7,10 +7,12 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/shopping_item.dart';
+import 'geofence_service.dart';
 import 'notification_service.dart';
+import 'reminder_service.dart';
+import 'reminder_storage_service.dart';
 import 'settings_service.dart';
 import 'store_state_service.dart';
-import 'geofence_service.dart';
 
 Future<void> initializeService() async {
   final service = FlutterBackgroundService();
@@ -26,12 +28,12 @@ Future<void> initializeService() async {
     ),
     iosConfiguration: IosConfiguration(),
   );
+
   await service.startService();
 }
 
 @pragma('vm:entry-point')
 void onStart(ServiceInstance service) {
-
   if (service is AndroidServiceInstance) {
     service.setAsForegroundService();
   }
@@ -49,6 +51,7 @@ void onStart(ServiceInstance service) {
         print(
           'Distance: $notificationDistance m | Interval: $checkIntervalMinutes min',
         );
+
         final position = await Geolocator.getCurrentPosition();
 
         print('LAT: ${position.latitude}');
@@ -61,8 +64,13 @@ void onStart(ServiceInstance service) {
 
         print("BACKGROUND ITEMS: ${data?.length}");
         print(data);
-
         print('SHOPPING ITEMS: ${data?.length ?? 0}');
+
+        if (data == null || data.isEmpty) {
+          print('NO SHOPPING ITEMS - SKIP OVERPASS');
+          return;
+        }
+
         final lat = position.latitude;
         final lon = position.longitude;
 
@@ -90,152 +98,169 @@ void onStart(ServiceInstance service) {
 
         print('STORE STATUS: ${response.statusCode}');
 
-        if (response.statusCode == 200) {
-          final json = jsonDecode(response.body);
-          final elements = json['elements'] as List;
+        if (response.statusCode != 200) {
+          return;
+        }
 
-          print('STORES FOUND: ${elements.length}');
+        final json = jsonDecode(response.body);
+        final elements = json['elements'] as List;
 
-          elements.sort((a, b) {
-            double getDistance(dynamic element) {
-              double? lat2;
-              double? lon2;
+        print('STORES FOUND: ${elements.length}');
 
-              if (element['type'] == 'node') {
-                lat2 = (element['lat'] as num?)?.toDouble();
-                lon2 = (element['lon'] as num?)?.toDouble();
-              } else if (element['center'] != null) {
-                lat2 = (element['center']['lat'] as num?)?.toDouble();
-                lon2 = (element['center']['lon'] as num?)?.toDouble();
-              }
-
-              if (lat2 == null || lon2 == null) {
-                return 999999;
-              }
-
-              return Geolocator.distanceBetween(
-                lat,
-                lon,
-                lat2,
-                lon2,
-              );
-            }
-
-            return getDistance(a).compareTo(getDistance(b));
-          });
-
-          for (final element in elements) {
-            final tags = element['tags'] ?? {};
-
-            final storeName =
-              (tags['name'] ?? '').toString();
-
-            if (storeName.isEmpty) continue;
-
-            double? storeLat;
-            double? storeLon;
+        elements.sort((a, b) {
+          double getDistance(dynamic element) {
+            double? lat2;
+            double? lon2;
 
             if (element['type'] == 'node') {
-              storeLat = (element['lat'] as num?)?.toDouble();
-              storeLon = (element['lon'] as num?)?.toDouble();
+              lat2 = (element['lat'] as num?)?.toDouble();
+              lon2 = (element['lon'] as num?)?.toDouble();
             } else if (element['center'] != null) {
-              storeLat = (element['center']['lat'] as num?)?.toDouble();
-              storeLon = (element['center']['lon'] as num?)?.toDouble();
+              lat2 = (element['center']['lat'] as num?)?.toDouble();
+              lon2 = (element['center']['lon'] as num?)?.toDouble();
             }
 
-            if (storeLat == null || storeLon == null) {
-              continue;
+            if (lat2 == null || lon2 == null) {
+              return 999999;
             }
 
-            final distance = Geolocator.distanceBetween(
+            return Geolocator.distanceBetween(
               lat,
               lon,
-              storeLat,
-              storeLon,
+              lat2,
+              lon2,
+            );
+          }
+
+          return getDistance(a).compareTo(getDistance(b));
+        });
+
+        for (final element in elements) {
+          final tags = element['tags'] ?? {};
+          final storeName = (tags['name'] ?? '').toString();
+
+          if (storeName.isEmpty) continue;
+
+          double? storeLat;
+          double? storeLon;
+
+          if (element['type'] == 'node') {
+            storeLat = (element['lat'] as num?)?.toDouble();
+            storeLon = (element['lon'] as num?)?.toDouble();
+          } else if (element['center'] != null) {
+            storeLat = (element['center']['lat'] as num?)?.toDouble();
+            storeLon = (element['center']['lon'] as num?)?.toDouble();
+          }
+
+          if (storeLat == null || storeLon == null) {
+            continue;
+          }
+
+          final distance = Geolocator.distanceBetween(
+            lat,
+            lon,
+            storeLat,
+            storeLon,
+          );
+
+          print('DISTANCE TO $storeName: ${distance.toStringAsFixed(0)} m');
+
+          final storeId = element['id'].toString();
+          final state = StoreStateService.getState(storeId);
+
+          state.lockedUntil ??=
+              await ReminderStorageService.loadLockedUntil(storeId);
+
+          if (ReminderService.isLocked(state.lockedUntil)) {
+            print('STORE LOCKED: $storeName');
+            continue;
+          }
+
+          if (state.lockedUntil != null &&
+              !ReminderService.isLocked(state.lockedUntil)) {
+            state.lockedUntil = null;
+            await ReminderStorageService.clearLockedUntil(storeId);
+          }
+
+          if (distance > notificationDistance) {
+            continue;
+          }
+
+          final matchingItems = <String>[];
+
+          for (final itemJson in data) {
+            final decoded = jsonDecode(itemJson);
+
+            print("${decoded['name']}  bought=${decoded['bought']}");
+
+            final bought = decoded['bought'] ?? false;
+
+            if (bought) continue;
+
+            final stores = List<String>.from(decoded['stores'] ?? []);
+
+            String normalizedStore = storeName.toLowerCase();
+
+            if (normalizedStore.contains('voi')) {
+              normalizedStore = 'migros';
+            }
+
+            if (normalizedStore.contains('migrolino')) {
+              normalizedStore = 'migros';
+            }
+
+            if (normalizedStore.contains('coop pronto')) {
+              normalizedStore = 'coop';
+            }
+
+            if (normalizedStore.contains('aldi suisse')) {
+              normalizedStore = 'aldi';
+            }
+
+            print('STORE MATCH CHECK: $storeName -> $normalizedStore');
+
+            final matches = stores.any(
+              (s) => normalizedStore.contains(
+                s.toLowerCase(),
+              ),
             );
 
-            print('DISTANCE TO $storeName: ${distance.toStringAsFixed(0)} m');
-
-            final storeId = element['id'].toString();
-            final state = StoreStateService.getState(storeId);
-
-            if (distance > notificationDistance) {
-              continue;
+            if (matches) {
+              matchingItems.add(decoded['name']);
             }
-            final matchingItems = <String>[];
+          }
 
-            for (final itemJson in data ?? []) {
-              final decoded = jsonDecode(itemJson);
+          if (matchingItems.isEmpty) {
+            continue;
+          }
 
-              print(
-                "${decoded['name']}  bought=${decoded['bought']}"
-              );
+          if (!GeofenceService.shouldNotify(
+            state: state,
+            distance: distance,
+            notificationDistance: notificationDistance,
+          )) {
+            continue;
+          }
 
-              final bought = decoded['bought'] ?? false;
+          print('MATCH FOUND IN $storeName');
+          print(matchingItems);
 
-              if (bought) continue;
-
-              final stores =
-              List<String>.from(decoded['stores'] ?? []);
-
-              String normalizedStore = storeName.toLowerCase();
-
-              if (normalizedStore.contains('voi')) {
-                normalizedStore = 'migros';
-              }
-              if (normalizedStore.contains('migrolino')) {
-                normalizedStore = 'migros';
-              }
-              if (normalizedStore.contains('coop pronto')) {
-                normalizedStore = 'coop';
-              }
-              if (normalizedStore.contains('aldi suisse')) {
-                normalizedStore = 'aldi';
-              }
-              print('STORE MATCH CHECK: $storeName -> $normalizedStore');
-
-              final matches = stores.any(
-                (s) => normalizedStore.contains(
-                  s.toLowerCase(),
-                ),
-              );
-
-              if (matches) {
-                matchingItems.add(decoded['name']);
-              }
-            }
-
-            if (matchingItems.isNotEmpty) {
-
-            if (!GeofenceService.shouldNotify(
-              state: state,
-              distance: distance,
-              notificationDistance: notificationDistance,
-            )) {
-              continue;
-            }
-
-            print('MATCH FOUND IN $storeName');
-            print(matchingItems);
-
-            await showStoreNotification(
-              storeName,
-              matchingItems
+          await showStoreNotification(
+            storeName,
+            matchingItems
                 .map(
                   (e) => ShoppingItem(
                     name: e,
-                    stores: [],
+                    stores: const [],
                     priority: 'normal',
                   ),
                 )
                 .toList(),
-              );
+            distance: distance,
+          );
 
-              break;
-            }
-          }
+          break;
         }
-
       } catch (e) {
         print('GPS ERROR: $e');
       }
