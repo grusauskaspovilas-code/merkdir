@@ -4,6 +4,7 @@ class StoreState {
   bool insideZone;
   bool notificationShown;
 
+  DateTime? lastNotification;
   DateTime? lockedUntil;
   DateTime? ignoreUntil;
 

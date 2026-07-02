@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/shopping_item.dart';
 import 'notification_service.dart';
 import 'settings_service.dart';
+import 'store_state_service.dart';
+import 'geofence_service.dart';
 
 Future<void> initializeService() async {
   final service = FlutterBackgroundService();
@@ -155,6 +157,7 @@ void onStart(ServiceInstance service) {
             print('DISTANCE TO $storeName: ${distance.toStringAsFixed(0)} m');
 
             final storeId = element['id'].toString();
+            final state = StoreStateService.getState(storeId);
 
             if (distance > notificationDistance) {
               continue;
@@ -204,16 +207,13 @@ void onStart(ServiceInstance service) {
 
             if (matchingItems.isNotEmpty) {
 
-              final now = DateTime.now();
-
-              if (lastNotifiedStore == storeId &&
-                  lastNotificationTime != null &&
-                  now.difference(lastNotificationTime!).inMinutes < checkIntervalMinutes) {
-                continue;
-              }
-
-              lastNotifiedStore = storeId;
-              lastNotificationTime = now;
+            if (!GeofenceService.shouldNotify(
+              state: state,
+              distance: distance,
+              notificationDistance: notificationDistance,
+            )) {
+              continue;
+            }
 
             print('MATCH FOUND IN $storeName');
             print(matchingItems);
