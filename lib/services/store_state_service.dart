@@ -1,16 +1,20 @@
 import '../models/store_state.dart';
 
 class StoreStateService {
-  static final Map<String, StoreState> _stores = {};
+  static final Map<String, StoreState> _states = {};
 
-  static StoreState get(String storeId) {
-    return _stores.putIfAbsent(
+  static StoreState getState(String storeId) {
+    return _states.putIfAbsent(
       storeId,
       () => StoreState(storeId: storeId),
     );
   }
 
   static void clear() {
-    _stores.clear();
+    _states.clear();
+  }
+
+  static void remove(String storeId) {
+    _states.remove(storeId);
   }
 }
